@@ -7,7 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 
 from config import settings
 from models.provider import GeminiProvider
-from github.client import GitHubClient
+from github_client.client import GitHubClient
 
 gh = GitHubClient()
 
