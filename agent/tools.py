@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -8,6 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from config import settings
 from models.provider import GeminiProvider
 from github_client.client import GitHubClient
+import git_ops
 
 gh = GitHubClient()
 
@@ -112,16 +112,8 @@ Return ONLY the issue numbers, one per line, nothing else. Example:
 
 
 def clone_repo(repo_name: str) -> Path:
-    namespace = repo_name.replace("/", "_")
-    dest = settings.WORK_DIR / namespace
-    if dest.exists():
-        return dest
-    url = f"https://github.com/{repo_name}.git"
-    subprocess.run(
-        ["git", "clone", url, str(dest)],
-        check=True, capture_output=True, text=True,
-    )
-    return dest
+    """Clone repo using git_ops (with GITHUB_TOKEN auth)."""
+    return git_ops.clone(repo_name)
 
 
 def read_file_structure(repo_path: Path, max_depth: int = 3, max_files: int = 200) -> str:
@@ -363,21 +355,25 @@ Output a structured, step-by-step plan."""
 
 
 def fork_and_prepare_repo(repo_name: str, branch_name: str, llm: GeminiProvider, plan: str) -> str:
-    user = gh.get_user()
-    fork = gh.create_fork(repo_name)
-    fork_full = f"{user}/{repo_name.split('/')[1]}"
+    """Fork, clone, branch, then ask LLM to generate code changes.
 
+    Uses git_ops for all git/fork operations.
+    """
+    # 1. Clone (with token auth)
     namespace = repo_name.replace("/", "_")
     repo_path = settings.WORK_DIR / namespace
+    if not repo_path.exists() or not (repo_path / ".git").exists():
+        repo_path = git_ops.clone(repo_name)
 
-    if not repo_path.exists():
-        clone_repo(repo_name)
+    # 2. Fork
+    fork_name = git_ops.fork(repo_name)
 
-    fork_url = f"https://{user}:{settings.GITHUB_TOKEN}@github.com/{fork_full}.git"
-    subprocess.run(["git", "remote", "add", "fork", fork_url], cwd=str(repo_path), capture_output=True)
-    subprocess.run(["git", "fetch", "fork"], cwd=str(repo_path), capture_output=True)
-    subprocess.run(["git", "checkout", "-b", branch_name], cwd=str(repo_path), check=True, capture_output=True)
+    # 3. Add fork remote + fetch + create branch
+    git_ops.add_remote(repo_path, "fork", fork_name)
+    git_ops.fetch(repo_path, "fork")
+    git_ops.checkout_new_branch(repo_path, branch_name)
 
+    # 4. Ask LLM to generate changes
     prompt = f"""The repository is cloned at {repo_path}. Here is the plan:
 
 {plan}
@@ -422,16 +418,12 @@ def write_changes(repo_path: Path, changes_text: str) -> str:
 
 
 def commit_and_push(repo_path: Path, branch_name: str, commit_msg: str) -> None:
-    subprocess.run(["git", "add", "."], cwd=str(repo_path), check=True, capture_output=True)
-    subprocess.run(["git", "commit", "-m", commit_msg], cwd=str(repo_path), check=True, capture_output=True)
-    subprocess.run(["git", "push", "fork", branch_name], cwd=str(repo_path), check=True, capture_output=True)
+    """Stage all, commit, and push to fork remote. Uses git_ops."""
+    git_ops.stage_all(repo_path)
+    git_ops.commit(repo_path, commit_msg)
+    git_ops.push(repo_path, "fork", branch_name)
 
 
 def create_pr(repo_name: str, branch_name: str, title: str, body: str) -> str:
-    user = gh.get_user()
-    fork_repo = repo_name.split("/")[1]
-    head = f"{user}:{branch_name}"
-    repo = gh.get_repo(repo_name)
-    base = repo.default_branch
-    pr = gh.create_pull_request(repo_name, head=head, base=base, title=title, body=body)
-    return pr.html_url
+    """Create a PR from fork to upstream. Uses git_ops."""
+    return git_ops.create_pr(repo_name, branch_name, title, body)
