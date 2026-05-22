@@ -42,14 +42,18 @@ def check_config() -> bool:
 
 
 def choose_model() -> str:
+    models = GeminiProvider.list_models()
+    if not models:
+        console.print("[red]No models available. Check GEMINI_API_KEY.[/red]")
+        sys.exit(1)
     console.print("\n[bold]Models:[/bold]")
-    for i, m in enumerate(GeminiProvider.MODELS, 1):
+    for i, m in enumerate(models, 1):
         console.print(f"  {i}. {m}")
     idx = Prompt.ask("Select", default="1")
     try:
-        return GeminiProvider.MODELS[max(0, int(idx) - 1)]
+        return models[max(0, int(idx) - 1)]
     except (ValueError, IndexError):
-        return GeminiProvider.MODELS[0]
+        return models[0]
 
 
 def collect_repos() -> list[str]:
