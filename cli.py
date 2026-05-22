@@ -42,11 +42,13 @@ def check_config() -> bool:
 
 
 def choose_model() -> str:
-    models = GeminiProvider.list_models()
+    with console.status("[bold cyan]Fetching available models from Google AI...[/bold cyan]", spinner="dots"):
+        models = GeminiProvider.list_models()
     if not models:
         console.print("[red]No models available. Check GEMINI_API_KEY.[/red]")
         sys.exit(1)
-    console.print("\n[bold]Models:[/bold]")
+    console.print(f"[dim]Found {len(models)} models[/dim]\n")
+    console.print("[bold]Models:[/bold]")
     for i, m in enumerate(models, 1):
         console.print(f"  {i}. {m}")
     idx = Prompt.ask("Select", default="1")
@@ -84,17 +86,25 @@ def pick_repo(repos: list[str]) -> str:
 
 
 def pick_issue(repo: str) -> int:
-    console.print(f"\n[bold]Issues for {repo}:[/bold]")
-    issues = fetch_open_issues(repo)
+    console.print(f"[dim]Fetching recent issues (last 2 days, max 50)...[/dim]")
+    with console.status(f"[bold cyan]Fetching issues for {repo}...[/bold cyan]", spinner="dots"):
+        issues = fetch_open_issues(repo, limit=50, recent_days=2)
     if not issues:
-        console.print("[yellow]None found. Will analyze code only.[/yellow]")
+        console.print("[yellow]No recent issues found. Will analyze code only.[/yellow]")
         return 0
+    console.print(f"\n[bold]Recent Issues for {repo}:[/bold] ({len(issues)} found)")
     table = Table(box=box.SIMPLE)
     table.add_column("#", style="cyan")
     table.add_column("Title")
     table.add_column("Labels", style="green")
-    for i in issues:
-        table.add_row(str(i["number"]), i["title"][:60], ", ".join(i["labels"][:3]))
+    table.add_column("Comments", style="dim")
+    for i in issues[:20]:
+        table.add_row(
+            str(i["number"]),
+            i["title"][:60],
+            ", ".join(i["labels"][:3]),
+            str(i.get("comments", 0)),
+        )
     console.print(table)
     val = Prompt.ask("Issue number (or 0 to skip)", default=str(issues[0]["number"]))
     try:
@@ -120,6 +130,18 @@ def plan_menu() -> tuple[bool, str]:
     return False, "CANCELLED"
 
 
+def _step_icon(step: str) -> str:
+    icons = {
+        "parsed": "Parsing input",
+        "info_fetched": "Repo info fetched",
+        "analyzed": "Analysis complete",
+        "plan_ready": "Plan generated",
+        "approved": "Plan approved",
+        "pr_created": "PR created",
+    }
+    return icons.get(step, step)
+
+
 def run() -> None:
     banner()
     if not check_config():
@@ -129,39 +151,44 @@ def run() -> None:
     repos = collect_repos()
     repo = pick_repo(repos)
     issue = pick_issue(repo)
-    console.print(f"\n[bold green]→ {repo}[/bold green] | Issue #{issue} | {model}\n")
+    console.print(f"\n[bold green]> {repo}[/bold green] | Issue #{issue} | {model}\n")
 
     # ── Phase 1: Analysis ──────────────────────────────────
+    console.rule("[bold cyan]Phase 1: Analysis[/bold cyan]")
     analysis_graph = build_analysis_graph(ctx)
     plan = ""
 
-    for event in analysis_graph.stream(
-        AgentState(
-            raw_input=repo,
-            repos=repos,
-            selected_model=model,
-            selected_repo=repo,
-            selected_issue=issue,
-        ),
-        {"recursion_limit": settings.MAX_STEPS},
-    ):
-        for node, updates in event.items():
-            if updates.get("error"):
-                console.print(f"[red]Error [{node}]: {updates['error']}[/red]")
-                return
-            if updates.get("step") == "analyzed":
-                details = updates.get("issue_details", "")
-                console.print(f"[green]Analysis complete.[/green]")
-                if details:
-                    console.print(Markdown(f"**Issues:**\n{details}"))
-            if updates.get("step") == "plan_ready":
-                plan = updates.get("proposed_plan", "")
+    with console.status("[bold cyan]Running analysis pipeline...[/bold cyan]", spinner="dots") as status:
+        for event in analysis_graph.stream(
+            AgentState(
+                raw_input=repo,
+                repos=repos,
+                selected_model=model,
+                selected_repo=repo,
+                selected_issue=issue,
+            ),
+            {"recursion_limit": settings.MAX_STEPS},
+        ):
+            for node, updates in event.items():
+                if updates.get("error"):
+                    console.print(f"[red]Error [{node}]: {updates['error']}[/red]")
+                    return
+                step = updates.get("step", "")
+                status.update(f"[bold cyan]{_step_icon(step)}...[/bold cyan]")
+                if step == "analyzed":
+                    details = updates.get("issue_details", "")
+                    console.print(f"  [green]Analysis complete.[/green]")
+                    if details:
+                        console.print(Markdown(f"**Issues:**\n{details}"))
+                if step == "plan_ready":
+                    plan = updates.get("proposed_plan", "")
 
     if not plan:
         console.print("[yellow]No plan generated.[/yellow]")
         return
 
     # ── Phase 2: User Approval ─────────────────────────────
+    console.rule("[bold cyan]Phase 2: Review Plan[/bold cyan]")
     show_plan(plan)
     approved, feedback = plan_menu()
 
@@ -171,51 +198,57 @@ def run() -> None:
         console.print("[yellow]Cancelled.[/yellow]")
         return
     else:
-        console.print("[yellow]Edit requested. Regenerate with feedback...[/yellow]")
+        console.print("[yellow]Edit requested. Regenerating...[/yellow]")
         ctx.user_feedback = feedback
-        for event in analysis_graph.stream(
+        with console.status("[bold cyan]Regenerating plan with feedback...[/bold cyan]", spinner="dots") as status:
+            for event in analysis_graph.stream(
+                AgentState(
+                    raw_input=repo,
+                    repos=repos,
+                    selected_model=model,
+                    selected_repo=repo,
+                    selected_issue=issue,
+                    user_feedback=feedback,
+                ),
+                {"recursion_limit": settings.MAX_STEPS},
+            ):
+                for node, updates in event.items():
+                    if updates.get("step") == "plan_ready":
+                        plan = updates.get("proposed_plan", "")
+                        show_plan(plan)
+                        approved, _ = plan_menu()
+                        if not approved:
+                            console.print("[yellow]Cancelled.[/yellow]")
+                            return
+
+    # ── Phase 3: Execution ─────────────────────────────────
+    console.rule("[bold cyan]Phase 3: Execution[/bold cyan]")
+    exec_graph = build_execution_graph(ctx)
+
+    with console.status("[bold cyan]Executing changes...[/bold cyan]", spinner="dots") as status:
+        for event in exec_graph.stream(
             AgentState(
-                raw_input=repo,
                 repos=repos,
                 selected_model=model,
                 selected_repo=repo,
                 selected_issue=issue,
-                user_feedback=feedback,
+                proposed_plan=plan,
+                plan_approved=True,
+                issues_found=ctx.issues,
+                step="plan_ready",
             ),
             {"recursion_limit": settings.MAX_STEPS},
         ):
             for node, updates in event.items():
-                if updates.get("step") == "plan_ready":
-                    plan = updates.get("proposed_plan", "")
-                    show_plan(plan)
-                    approved, _ = plan_menu()
-                    if not approved:
-                        console.print("[yellow]Cancelled.[/yellow]")
-                        return
-
-    # ── Phase 3: Execution ─────────────────────────────────
-    exec_graph = build_execution_graph(ctx)
-    for event in exec_graph.stream(
-        AgentState(
-            repos=repos,
-            selected_model=model,
-            selected_repo=repo,
-            selected_issue=issue,
-            proposed_plan=plan,
-            plan_approved=True,
-            issues_found=ctx.issues,
-            step="plan_ready",
-        ),
-        {"recursion_limit": settings.MAX_STEPS},
-    ):
-        for node, updates in event.items():
-            if updates.get("error"):
-                console.print(f"[red]Error [{node}]: {updates['error']}[/red]")
-                return
-            pr_url = updates.get("pr_url")
-            if pr_url:
-                console.print(f"\n[bold green]PR created:[/bold green] {pr_url}")
-                return
+                if updates.get("error"):
+                    console.print(f"[red]Error [{node}]: {updates['error']}[/red]")
+                    return
+                step = updates.get("step", "")
+                status.update(f"[bold cyan]{_step_icon(step)}...[/bold cyan]")
+                pr_url = updates.get("pr_url")
+                if pr_url:
+                    console.print(f"\n[bold green]PR created:[/bold green] {pr_url}")
+                    return
 
     console.print("[bold]Done.[/bold]")
 

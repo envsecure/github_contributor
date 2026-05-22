@@ -44,18 +44,71 @@ def fetch_repo_info(repo_name: str) -> dict:
         return {"name": repo_name, "error": str(e)}
 
 
-def fetch_open_issues(repo_name: str, limit: int = 5) -> list[dict]:
-    issues = gh.get_open_issues(repo_name)
+def fetch_open_issues(repo_name: str, limit: int = 50, recent_days: int = 2) -> list[dict]:
+    """Fetch recent open issues (not PRs), filtered to last N days, up to limit."""
+    issues = gh.get_open_issues(repo_name, limit=limit, recent_days=recent_days)
     results = []
-    for issue in issues[:limit]:
-        if not issue.pull_request:
-            results.append({
-                "number": issue.number,
-                "title": issue.title,
-                "body": (issue.body or "")[:500],
-                "labels": [l.name for l in issue.labels],
-            })
+    for issue in issues:
+        results.append({
+            "number": issue.number,
+            "title": issue.title,
+            "body": (issue.body or "")[:500],
+            "labels": [l.name for l in issue.labels],
+            "comments": issue.comments,
+            "created_at": issue.created_at.isoformat() if issue.created_at else "",
+        })
     return results
+
+
+def detect_high_value_issues(issues: list[dict], llm: GeminiProvider, repo_name: str) -> list[dict]:
+    """Use AI to rank issues by value for a contributor. Returns top issues."""
+    if not issues:
+        return []
+
+    issues_text = "\n".join(
+        f"#{i['number']} | {i['title']} | labels: {', '.join(i['labels'])} | comments: {i['comments']}"
+        for i in issues[:50]
+    )
+
+    prompt = f"""You are analyzing open issues for **{repo_name}** to find the best ones for an OSS contributor.
+
+Here are the recent open issues (last 2 days):
+{issues_text}
+
+Pick the TOP 5 most valuable issues for a contributor to work on. Consider:
+- Issues with "good first issue", "help wanted", "bug" labels (high value)
+- Issues with clear descriptions and moderate complexity
+- Issues that are not too broad or vague
+- Bugs over feature requests for new contributors
+
+Return ONLY the issue numbers, one per line, nothing else. Example:
+42
+107
+233"""
+
+    msg = llm.invoke([
+        SystemMessage(content="You are an OSS contribution advisor. Return only issue numbers."),
+        HumanMessage(content=prompt),
+    ])
+
+    # Parse the numbers from AI response
+    top_numbers = set()
+    for line in msg.strip().split("\n"):
+        line = line.strip().lstrip("#")
+        if line.isdigit():
+            top_numbers.add(int(line))
+
+    # Return matching issues in original order
+    ranked = [i for i in issues if i["number"] in top_numbers]
+    # If AI didn't return valid numbers, fall back to label-based ranking
+    if not ranked:
+        priority_labels = {"good first issue", "help wanted", "bug", "enhancement", "documentation"}
+        ranked = sorted(
+            issues,
+            key=lambda i: sum(1 for l in i["labels"] if l.lower() in priority_labels),
+            reverse=True,
+        )
+    return ranked[:10]
 
 
 def clone_repo(repo_name: str) -> Path:

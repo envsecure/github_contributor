@@ -5,6 +5,7 @@ from agent.tools import (
     parse_repos,
     fetch_repo_info,
     fetch_open_issues,
+    detect_high_value_issues,
     clone_repo,
     read_file_structure,
     read_key_files,
@@ -37,21 +38,48 @@ def fetch_info_node(state: AgentState, ctx: SessionContext) -> dict:
 
 
 def clone_and_analyze_node(state: AgentState, ctx: SessionContext) -> dict:
+    from rich.console import Console
+    console = Console()
+
     repo = state.selected_repo
     llm = GeminiProvider(state.selected_model)
 
-    issues = fetch_open_issues(repo)
+    # Step 1: Fetch recent issues (last 2 days, up to 50)
+    console.print("  [dim]10%[/dim] Fetching recent open issues...")
+    issues = fetch_open_issues(repo, limit=50, recent_days=2)
+    console.print(f"  [dim]20%[/dim] Found {len(issues)} issues. Filtering PRs...")
+
+    # Step 2: Filter out PRs already done in fetch_open_issues, detect high-value
+    if issues:
+        console.print("  [dim]30%[/dim] AI detecting high-value issues...")
+        issues = detect_high_value_issues(issues, llm, repo)
+        console.print(f"  [dim]40%[/dim] Selected {len(issues)} high-value issues.")
+    else:
+        console.print("  [dim]30%[/dim] No recent issues found. Will analyze code only.")
+
     ctx.issues = issues
 
+    # Step 3: Clone repo
+    console.print("  [dim]50%[/dim] Cloning repository...")
     repo_path = clone_repo(repo)
+
+    # Step 4: Read structure
+    console.print("  [dim]60%[/dim] Reading file structure...")
     structure = read_file_structure(repo_path)
+
+    # Step 5: Read key files (10% of analysis)
+    console.print("  [dim]70%[/dim] Reading key files...")
     files = read_key_files(
         repo_path,
         ["*.py", "*.js", "*.ts", "*.rs", "*.go", "*.md", "*.json", "Cargo.toml", "package.json", "pyproject.toml"],
     )
 
+    # Step 6: LLM analysis
+    console.print("  [dim]80%[/dim] Analyzing code with AI...")
     analysis = analyze_repo_with_llm(repo, structure, files, issues, llm)
     ctx.analysis = analysis
+    console.print("  [dim]100%[/dim] Analysis complete.")
+
     ctx.add_message("system", f"Analysis complete for {repo}.")
 
     return {
@@ -62,10 +90,14 @@ def clone_and_analyze_node(state: AgentState, ctx: SessionContext) -> dict:
 
 
 def generate_plan_node(state: AgentState, ctx: SessionContext) -> dict:
+    from rich.console import Console
+    console = Console()
+
     llm = GeminiProvider(state.selected_model)
     user_context = ctx.conversation_history()
     issue_num = state.selected_issue or (state.issues_found[0]["number"] if state.issues_found else 0)
 
+    console.print("  [dim]Generating implementation plan...[/dim]")
     plan = create_plan(llm, state.selected_repo, state.repo_analysis, state.issues_found, issue_num, user_context)
     ctx.plan = plan
     ctx.add_message("system", "Plan generated.")

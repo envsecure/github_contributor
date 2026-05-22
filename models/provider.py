@@ -21,7 +21,20 @@ class GeminiProvider:
         )
 
     def invoke(self, messages: list[BaseMessage]) -> str:
-        return self.llm.invoke(messages).content
+        content = self.llm.invoke(messages).content
+        if isinstance(content, list):
+            return "".join(
+                block.get("text", "") if isinstance(block, dict) else str(block)
+                for block in content
+            )
+        return str(content)
+
+    def invoke_verbose(self, messages: list[BaseMessage], label: str = "Thinking") -> str:
+        """Invoke with console progress indicator."""
+        from rich.console import Console
+        console = Console()
+        with console.status(f"[bold cyan]{label}...[/bold cyan]", spinner="dots"):
+            return self.invoke(messages)
 
     @staticmethod
     def list_models() -> list[str]:
