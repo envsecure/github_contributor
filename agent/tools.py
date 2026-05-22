@@ -354,10 +354,15 @@ Output a structured, step-by-step plan."""
     return msg
 
 
-def fork_and_prepare_repo(repo_name: str, branch_name: str, llm: GeminiProvider, plan: str) -> str:
+def fork_and_prepare_repo(repo_name: str, branch_name: str, llm: GeminiProvider, plan: str) -> tuple[str, Path, str]:
     """Fork, clone, branch, then ask LLM to generate code changes.
 
-    Uses git_ops for all git/fork operations.
+    Uses git_ops for all git/fork operations. Handles errors automatically:
+    - Branch exists → uses alternative name
+    - Remote exists → uses existing remote
+
+    Returns:
+        (changes_text, repo_path, actual_branch_name)
     """
     # 1. Clone (with token auth)
     namespace = repo_name.replace("/", "_")
@@ -368,10 +373,10 @@ def fork_and_prepare_repo(repo_name: str, branch_name: str, llm: GeminiProvider,
     # 2. Fork
     fork_name = git_ops.fork(repo_name)
 
-    # 3. Add fork remote + fetch + create branch
+    # 3. Add fork remote + fetch + create branch (with error recovery)
     git_ops.add_remote(repo_path, "fork", fork_name)
     git_ops.fetch(repo_path, "fork")
-    git_ops.checkout_new_branch(repo_path, branch_name)
+    actual_branch = git_ops.checkout_new_branch(repo_path, branch_name)
 
     # 4. Ask LLM to generate changes
     prompt = f"""The repository is cloned at {repo_path}. Here is the plan:
@@ -387,7 +392,7 @@ Read the relevant files and output the exact changes needed. For each file, show
         SystemMessage(content="You are implementing changes. Output specific file modifications."),
         HumanMessage(content=prompt),
     ])
-    return msg
+    return msg, repo_path, actual_branch
 
 
 def write_changes(repo_path: Path, changes_text: str) -> str:

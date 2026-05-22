@@ -147,21 +147,34 @@ def plan_approved_node(state: AgentState, ctx: SessionContext) -> dict:
 
 
 def execute_changes_node(state: AgentState, ctx: SessionContext) -> dict:
+    from rich.console import Console
+    console = Console()
+
     repo = state.selected_repo
     llm = GeminiProvider(state.selected_model)
     issue_num = state.selected_issue or (state.issues_found[0]["number"] if state.issues_found else 0)
     issue_title = state.issues_found[0]["title"] if state.issues_found else ""
 
     branch_name = f"fix-{issue_num}-{repo.split('/')[1]}"
-    repo_path = clone_repo(repo)
 
-    changes = fork_and_prepare_repo(repo, branch_name, llm, state.proposed_plan)
-    ctx.add_message("system", f"Prepared changes for {branch_name}")
+    # Fork, clone, branch — with automatic error recovery
+    console.print("  [dim]10%[/dim] Forking and preparing repository...")
+    changes, repo_path, actual_branch = fork_and_prepare_repo(repo, branch_name, llm, state.proposed_plan)
+    if actual_branch != branch_name:
+        console.print(f"  [dim]  Branch renamed: {branch_name} → {actual_branch}[/dim]")
+    ctx.add_message("system", f"Prepared changes for {actual_branch}")
+
+    # Write LLM-generated changes to files
+    console.print("  [dim]50%[/dim] Writing changes to files...")
+    write_log = write_changes(repo_path, changes)
+    console.print(f"  [dim]60%[/dim] {write_log}")
 
     title = f"Fix: #{issue_num} - {issue_title}" if issue_num else "Code improvements"
     commit_msg = f"Fix #{issue_num}: {issue_title}" if issue_num else "Apply code improvements"
 
-    commit_and_push(repo_path, branch_name, commit_msg)
+    # Stage, commit, push — with automatic error recovery
+    console.print("  [dim]70%[/dim] Committing and pushing...")
+    commit_and_push(repo_path, actual_branch, commit_msg)
 
     pr_body = f"""## Description
 
@@ -175,7 +188,9 @@ Closes #{issue_num}
 - [x] Minimal, focused changes
 """
 
-    pr_url = create_pr(repo, branch_name, title, pr_body)
+    # Create PR
+    console.print("  [dim]90%[/dim] Creating pull request...")
+    pr_url = create_pr(repo, actual_branch, title, pr_body)
     ctx.pr_urls.append(pr_url)
     ctx.add_message("system", f"PR created: {pr_url}")
 
