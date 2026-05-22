@@ -21,6 +21,9 @@ class AgentState:
     repo_analysis: str = ""
     issues_found: list[dict] = field(default_factory=list)
     issue_details: str = ""
+    selected_files: list[str] = field(default_factory=list)
+    search_results: str = ""
+    file_contents: dict[str, str] = field(default_factory=dict)
 
     # planning
     proposed_plan: str = ""

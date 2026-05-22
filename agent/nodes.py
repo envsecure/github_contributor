@@ -8,6 +8,9 @@ from agent.tools import (
     detect_high_value_issues,
     clone_repo,
     read_file_structure,
+    search_code,
+    select_relevant_files,
+    read_file_chunked,
     read_key_files,
     analyze_repo_with_llm,
     create_plan,
@@ -44,39 +47,67 @@ def clone_and_analyze_node(state: AgentState, ctx: SessionContext) -> dict:
     repo = state.selected_repo
     llm = GeminiProvider(state.selected_model)
 
-    # Step 1: Fetch recent issues (last 2 days, up to 50)
-    console.print("  [dim]10%[/dim] Fetching recent open issues...")
+    # --- Step 1: Clone repo first (so we can search it) ---
+    console.print("  [dim] 5%[/dim] Cloning repository...")
+    repo_path = clone_repo(repo)
+
+    # --- Step 2: Read file tree ---
+    console.print("  [dim]10%[/dim] Reading file structure...")
+    structure = read_file_structure(repo_path, max_depth=4, max_files=300)
+    file_count = len(structure.splitlines()) if structure else 0
+    console.print(f"  [dim]12%[/dim] Found {file_count} files in tree.")
+
+    # --- Step 3: Fetch recent issues ---
+    console.print("  [dim]15%[/dim] Fetching recent open issues (last 2 days, max 50)...")
     issues = fetch_open_issues(repo, limit=50, recent_days=2)
     console.print(f"  [dim]20%[/dim] Found {len(issues)} issues. Filtering PRs...")
 
-    # Step 2: Filter out PRs already done in fetch_open_issues, detect high-value
+    # --- Step 4: AI high-value issue detection ---
     if issues:
-        console.print("  [dim]30%[/dim] AI detecting high-value issues...")
+        console.print("  [dim]25%[/dim] AI detecting high-value issues...")
         issues = detect_high_value_issues(issues, llm, repo)
-        console.print(f"  [dim]40%[/dim] Selected {len(issues)} high-value issues.")
+        console.print(f"  [dim]30%[/dim] Selected {len(issues)} high-value issues.")
     else:
-        console.print("  [dim]30%[/dim] No recent issues found. Will analyze code only.")
+        console.print("  [dim]25%[/dim] No recent issues found. Will analyze code only.")
 
     ctx.issues = issues
 
-    # Step 3: Clone repo
-    console.print("  [dim]50%[/dim] Cloning repository...")
-    repo_path = clone_repo(repo)
+    # --- Step 5: AI selects which files to read (OpenCode-style) ---
+    console.print("  [dim]35%[/dim] Searching code for relevant patterns...")
+    selected_files = select_relevant_files(repo_path, issues, llm, console)
+    console.print(f"  [dim]45%[/dim] Selected {len(selected_files)} files to read:")
+    for f in selected_files:
+        console.print(f"  [dim]       → {f}[/dim]")
 
-    # Step 4: Read structure
-    console.print("  [dim]60%[/dim] Reading file structure...")
-    structure = read_file_structure(repo_path)
+    # --- Step 6: Read selected files in chunks ---
+    file_contents = {}
+    total = len(selected_files) or 1
+    for idx, file_path in enumerate(selected_files):
+        pct = 50 + int(30 * (idx / total))
+        chunk = read_file_chunked(repo_path, file_path, chunk_size=4000, chunk_index=0)
+        size = chunk["total_size"]
+        chunks = chunk["chunks"]
+        if chunk.get("error"):
+            console.print(f"  [dim]{pct}%[/dim] ✗ {file_path}: {chunk['error']}")
+            continue
 
-    # Step 5: Read key files (10% of analysis)
-    console.print("  [dim]70%[/dim] Reading key files...")
-    files = read_key_files(
-        repo_path,
-        ["*.py", "*.js", "*.ts", "*.rs", "*.go", "*.md", "*.json", "Cargo.toml", "package.json", "pyproject.toml"],
-    )
+        if chunks > 1:
+            console.print(f"  [dim]{pct}%[/dim] Reading {file_path} ({size:,} chars, chunk 1/{chunks})...")
+            # Read remaining chunks
+            content = chunk["content"]
+            for ci in range(1, min(chunks, 3)):  # max 3 chunks per file
+                extra = read_file_chunked(repo_path, file_path, chunk_size=4000, chunk_index=ci)
+                content += "\n" + extra["content"]
+            file_contents[file_path] = content
+        else:
+            console.print(f"  [dim]{pct}%[/dim] Reading {file_path} ({size:,} chars, complete)")
+            file_contents[file_path] = chunk["content"]
 
-    # Step 6: LLM analysis
-    console.print("  [dim]80%[/dim] Analyzing code with AI...")
-    analysis = analyze_repo_with_llm(repo, structure, files, issues, llm)
+    ctx.file_contents = file_contents
+
+    # --- Step 7: LLM analysis ---
+    console.print("  [dim]85%[/dim] Analyzing code with AI...")
+    analysis = analyze_repo_with_llm(repo, structure, file_contents, issues, llm)
     ctx.analysis = analysis
     console.print("  [dim]100%[/dim] Analysis complete.")
 
@@ -85,6 +116,8 @@ def clone_and_analyze_node(state: AgentState, ctx: SessionContext) -> dict:
     return {
         "issues_found": issues,
         "issue_details": "\n".join(f"#{i['number']}: {i['title']}" for i in issues[:5]),
+        "selected_files": selected_files,
+        "file_contents": file_contents,
         "step": "analyzed",
     }
 
