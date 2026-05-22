@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import Optional
 from dataclasses import dataclass, field
 
+from config import settings
+
 
 @dataclass
 class AgentState:
@@ -11,7 +13,7 @@ class AgentState:
     repos: list[str] = field(default_factory=list)
 
     # selection
-    selected_model: str = "gemini-2.0-flash"
+    selected_model: str = settings.LLM_MODEL
     selected_repo: str = ""
     selected_issue: int = 0
 

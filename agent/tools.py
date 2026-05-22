@@ -201,13 +201,29 @@ Read the relevant files and output the exact changes needed. For each file, show
 
 def write_changes(repo_path: Path, changes_text: str) -> str:
     log = []
+    current_file = None
+    current_content = []
+
     for line in changes_text.split("\n"):
-        line = line.strip()
-        if line.startswith("FILE:"):
-            parts = line.split(":", 1)
-            if len(parts) == 2:
-                log.append(f"Referenced: {parts[1].strip()}")
-    return "\n".join(log) if log else "Changes parsed from plan."
+        stripped = line.strip()
+        if stripped.startswith("FILE:"):
+            if current_file and current_content:
+                file_path = repo_path / current_file
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text("\n".join(current_content), encoding="utf-8")
+                log.append(f"Written: {current_file}")
+            current_file = stripped.split(":", 1)[1].strip()
+            current_content = []
+        elif current_file is not None:
+            current_content.append(line)
+
+    if current_file and current_content:
+        file_path = repo_path / current_file
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_text("\n".join(current_content), encoding="utf-8")
+        log.append(f"Written: {current_file}")
+
+    return "\n".join(log) if log else "No files to write."
 
 
 def commit_and_push(repo_path: Path, branch_name: str, commit_msg: str) -> None:
@@ -218,6 +234,7 @@ def commit_and_push(repo_path: Path, branch_name: str, commit_msg: str) -> None:
 
 def create_pr(repo_name: str, branch_name: str, title: str, body: str) -> str:
     user = gh.get_user()
+    fork_repo = repo_name.split("/")[1]
     head = f"{user}:{branch_name}"
     repo = gh.get_repo(repo_name)
     base = repo.default_branch
