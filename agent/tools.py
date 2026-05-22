@@ -194,29 +194,213 @@ def read_file_chunked(repo_path: Path, file_path: str, chunk_size: int = 4000, c
     }
 
 
+def trace_imports(repo_path: Path, file_path: str, max_depth: int = 2) -> list[str]:
+    """Trace imports/exports from a file to find related files.
+
+    Given a file, finds:
+    - Files it imports from (upstream dependencies)
+    - Files that import from it (downstream dependents)
+
+    Follows the chain up to max_depth levels.
+    """
+    related = set()
+    to_check = {file_path}
+    checked = set()
+
+    for _ in range(max_depth):
+        next_check = set()
+        for fp in to_check:
+            if fp in checked:
+                continue
+            checked.add(fp)
+
+            full_path = repo_path / fp
+            if not full_path.exists() or not full_path.is_file():
+                continue
+
+            try:
+                text = full_path.read_text(encoding="utf-8", errors="ignore")
+            except Exception:
+                continue
+
+            # Extract imports from this file
+            imported_files = _extract_imports(repo_path, fp, text)
+            for imp in imported_files:
+                if imp not in checked:
+                    related.add(imp)
+                    next_check.add(imp)
+
+            # Find files that import this file
+            reverse_importers = _find_importers(repo_path, fp)
+            for imp in reverse_importers:
+                if imp not in checked:
+                    related.add(imp)
+                    next_check.add(imp)
+
+        to_check = next_check
+
+    return list(related)
+
+
+def _extract_imports(repo_path: Path, file_path: str, content: str) -> list[str]:
+    """Extract imported file paths from source code content."""
+    imports = []
+    rel_dir = Path(file_path).parent
+
+    for line in content.splitlines():
+        line = line.strip()
+
+        # Python: from X import Y / import X
+        if line.startswith("from ") and "import" in line:
+            module = line.split("from")[1].split("import")[0].strip()
+            resolved = _resolve_python_import(repo_path, rel_dir, module)
+            if resolved:
+                imports.append(resolved)
+
+        # JavaScript/TypeScript: import X from 'Y' / require('Y')
+        if "from '" in line or 'from "' in line:
+            module = line.split("from")[1].strip().strip("'\"`; ")
+            resolved = _resolve_js_import(repo_path, rel_dir, module)
+            if resolved:
+                imports.append(resolved)
+        elif "require(" in line:
+            start = line.index("require(") + 8
+            module = line[start:].split(")")[0].strip("'\"")
+            resolved = _resolve_js_import(repo_path, rel_dir, module)
+            if resolved:
+                imports.append(resolved)
+
+        # Go: import "X"
+        if line.startswith('"') and line.endswith('"'):
+            module = line.strip('"')
+            resolved = _resolve_go_import(repo_path, module)
+            if resolved:
+                imports.append(resolved)
+
+    return imports
+
+
+def _resolve_python_import(repo_path: Path, rel_dir: Path, module: str) -> str | None:
+    """Resolve a Python module import to a file path."""
+    parts = module.replace(".", "/")
+    candidates = [
+        repo_path / f"{parts}.py",
+        repo_path / parts / "__init__.py",
+        repo_path / rel_dir / f"{parts}.py",
+        repo_path / rel_dir / parts / "__init__.py",
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return str(c.relative_to(repo_path))
+    return None
+
+
+def _resolve_js_import(repo_path: Path, rel_dir: Path, module: str) -> str | None:
+    """Resolve a JS/TS module import to a file path."""
+    if not module.startswith("."):
+        return None  # Skip node_modules
+    candidates = [
+        repo_path / rel_dir / f"{module}.ts",
+        repo_path / rel_dir / f"{module}.tsx",
+        repo_path / rel_dir / f"{module}.js",
+        repo_path / rel_dir / f"{module}.jsx",
+        repo_path / rel_dir / module / "index.ts",
+        repo_path / rel_dir / module / "index.tsx",
+        repo_path / rel_dir / module / "index.js",
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return str(c.relative_to(repo_path))
+    return None
+
+
+def _resolve_go_import(repo_path: Path, module: str) -> str | None:
+    """Resolve a Go module import to a file path."""
+    if not module.startswith("./") and not module.startswith("../"):
+        return None  # Skip stdlib and external
+    parts = module.lstrip("./").lstrip("../")
+    candidates = [
+        repo_path / f"{parts}.go",
+        repo_path / parts / "main.go",
+    ]
+    for c in candidates:
+        if c.exists() and c.is_file():
+            return str(c.relative_to(repo_path))
+    return None
+
+
+def _find_importers(repo_path: Path, target_file: str) -> list[str]:
+    """Find all files that import the target file."""
+    importers = []
+    target_stem = Path(target_file).stem
+
+    for p in repo_path.rglob("*"):
+        if not p.is_file() or p.name.startswith(".") or p.name in {"node_modules", "__pycache__", ".git"}:
+            continue
+        if p.stat().st_size > 200_000:
+            continue
+        try:
+            text = p.read_text(encoding="utf-8", errors="ignore")
+        except Exception:
+            continue
+
+        rel = str(p.relative_to(repo_path))
+        if rel == target_file:
+            continue
+
+        # Check if this file references the target
+        if target_stem in text:
+            # More precise: check for actual import patterns
+            for line in text.splitlines():
+                line = line.strip()
+                # Python import
+                if f"from {target_stem}" in line or f"import {target_stem}" in line:
+                    importers.append(rel)
+                    break
+                # JS import
+                if f"'./{target_stem}'" in line or f'"{target_stem}"' in line:
+                    importers.append(rel)
+                    break
+                # Go import
+                if f'"{target_file}"' in line:
+                    importers.append(rel)
+                    break
+
+    return importers
+
+
 def select_relevant_files(repo_path: Path, issues: list[dict], llm: GeminiProvider, console=None) -> list[str]:
-    """AI selects which files to read based on the file tree and issues. OpenCode-style."""
+    """AI selects which files to read. Handles both cases: with issues and without.
+
+    Strategy (OpenCode-style):
+    1. Read file tree
+    2. If issues exist: keyword search + AI selection + import tracing
+    3. If no issues: explore structure, find entry points, AI picks important files
+    """
     tree = read_file_structure(repo_path, max_depth=4, max_files=300)
     if not tree:
         return []
 
-    issues_text = "\n".join(
-        f"#{i['number']}: {i['title']} [{', '.join(i['labels'])}]"
-        for i in issues[:10]
-    ) or "(no issues)"
+    searched_files = []
 
-    # Also do keyword search for relevant terms from issue titles
-    search_hits = []
-    for issue in issues[:5]:
-        words = [w for w in issue["title"].split() if len(w) > 3]
-        for word in words[:3]:
-            hits = search_code(repo_path, word, max_results=5)
-            search_hits.extend(hits)
-    # Deduplicate files from search
-    searched_files = list(dict.fromkeys(h["file"] for h in search_hits))[:20]
-    search_context = "\n".join(f"  {f}" for f in searched_files) if searched_files else "(none)"
+    if issues:
+        # --- Case A: Issues found ---
+        issues_text = "\n".join(
+            f"#{i['number']}: {i['title']} [{', '.join(i['labels'])}]"
+            for i in issues[:10]
+        )
 
-    prompt = f"""You are analyzing repository code to find files relevant to fixing these issues.
+        # Keyword search for relevant terms from issue titles
+        search_hits = []
+        for issue in issues[:5]:
+            words = [w for w in issue["title"].split() if len(w) > 3]
+            for word in words[:3]:
+                hits = search_code(repo_path, word, max_results=5)
+                search_hits.extend(hits)
+        searched_files = list(dict.fromkeys(h["file"] for h in search_hits))[:20]
+        search_context = "\n".join(f"  {f}" for f in searched_files) if searched_files else "(none)"
+
+        prompt = f"""You are analyzing repository code to find files relevant to fixing these issues.
 
 ## File Tree
 {tree[:4000]}
@@ -239,6 +423,42 @@ src/schema.ts
 packages/core/src/index.ts
 tests/schema.test.ts"""
 
+    else:
+        # --- Case B: No issues found — explore the codebase ---
+        if console:
+            console.print("  [dim]  No issues. Exploring codebase structure...[/dim]")
+
+        # Find entry points and important files by pattern
+        entry_patterns = [
+            "main.*", "index.*", "app.*", "server.*", "cli.*",
+            "setup.*", "config.*", "Cargo.toml", "package.json",
+            "pyproject.toml", "go.mod", "Makefile",
+        ]
+        for pat in entry_patterns:
+            found = glob_files(repo_path, pat, max_results=5)
+            searched_files.extend(found)
+        searched_files = list(dict.fromkeys(searched_files))[:15]
+
+        entry_context = "\n".join(f"  {f}" for f in searched_files) if searched_files else "(none)"
+
+        prompt = f"""You are analyzing a repository to understand its structure and find areas for improvement.
+
+## File Tree
+{tree[:4000]}
+
+## Entry Points and Key Files Found
+{entry_context}
+
+Your task: Select the 8-12 most important files to read in order to understand this codebase and find potential improvements.
+Focus on:
+- Entry points (main, index, app, server)
+- Core modules and their dependencies
+- Configuration files
+- Files with complex logic that might have bugs
+- Test files to understand test coverage
+
+Return ONLY file paths, one per line, nothing else."""
+
     if console:
         console.print("  [dim]  AI selecting relevant files...[/dim]")
 
@@ -253,7 +473,6 @@ tests/schema.test.ts"""
         line = line.strip().strip("`").strip()
         if not line or line.startswith("#") or line.startswith("-") or line.startswith("*"):
             continue
-        # Clean up markdown formatting
         line = line.lstrip("0123456789). ").strip()
         if line and (repo_path / line).exists():
             selected.append(line)
@@ -264,10 +483,26 @@ tests/schema.test.ts"""
 
     # Fallback: if still empty, use pattern-based selection
     if not selected:
-        selected = read_key_files(repo_path, ["*.py", "*.js", "*.ts", "*.rs", "*.go"])
-        selected = list(selected.keys())[:10]
+        selected = list(read_key_files(repo_path, ["*.py", "*.js", "*.ts", "*.rs", "*.go"]).keys())[:10]
 
-    return selected[:10]
+    # --- Import tracing: follow dependencies of selected files ---
+    if console:
+        console.print("  [dim]  Tracing imports/exports...[/dim]")
+
+    traced = set(selected)
+    for f in selected[:5]:  # Trace top 5 files to avoid explosion
+        related = trace_imports(repo_path, f, max_depth=1)
+        for r in related:
+            if r not in traced:
+                traced.add(r)
+
+    # Merge: keep original order, append traced files
+    final = list(selected)
+    for f in traced:
+        if f not in final:
+            final.append(f)
+
+    return final[:15]
 
 
 def read_key_files(repo_path: Path, patterns: list[str]) -> dict[str, str]:

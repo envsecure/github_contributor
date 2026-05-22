@@ -78,10 +78,17 @@ This is the core analysis step. It follows the **OpenCode-style** file discovery
 35%  Keyword search for issue-related code
      │   (searches issue title words in all files)
      │
-45%  AI selects relevant files (5-10 files)
-     │   (sends tree + search hits + issues to LLM)
+     ├── IF ISSUES FOUND:
+     │   45%  AI selects files relevant to fixing issues
      │
-50-80%  Read each selected file in chunks
+     ├── IF NO ISSUES:
+     │   45%  Explore codebase: find entry points, main modules
+     │        AI picks 8-12 important files to understand the code
+     │
+50%  Trace imports/exports of selected files
+     │   (finds related files via import chains)
+     │
+55-80%  Read each file in chunks
      │   (4000 chars per chunk, max 3 chunks per file)
      │
 85%  Analyze code with AI
@@ -92,9 +99,10 @@ This is the core analysis step. It follows the **OpenCode-style** file discovery
 
 **Key insight**: The agent does NOT read all files. It:
 1. Discovers the file tree
-2. Searches for keywords from issue titles
-3. Asks AI to pick the 5-10 most relevant files
-4. Reads only those files (in chunks if large)
+2. If issues exist: searches keywords + AI selects issue-relevant files
+3. If no issues: explores entry points + AI picks important files
+4. **Traces imports/exports** to find related files (the file itself + what it imports + what imports it)
+5. Reads only those files (in chunks if large)
 
 ---
 
